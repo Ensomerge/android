@@ -1,378 +1,199 @@
 package org.horaapps.leafpic.data;
 
 import android.content.Context;
-import android.content.Intent;
-import android.graphics.Bitmap;
-import android.graphics.BitmapFactory;
-import android.graphics.Canvas;
-import android.graphics.Color;
-import android.media.MediaScannerConnection;
-import android.media.ThumbnailUtils;
-import android.provider.MediaStore;
+import android.util.Log;
 
-import org.horaapps.leafpic.R;
-import org.horaapps.leafpic.activities.SplashScreen;
-import org.horaapps.leafpic.data.base.AlbumsComparators;
-import org.horaapps.leafpic.data.base.SortingMode;
-import org.horaapps.leafpic.data.base.SortingOrder;
-import org.horaapps.leafpic.data.providers.MediaStoreProvider;
-import org.horaapps.leafpic.data.providers.StorageProvider;
-import org.horaapps.leafpic.util.ContentHelper;
-import org.horaapps.leafpic.util.PreferenceUtil;
-import org.horaapps.leafpic.util.StringUtils;
+import com.orhanobut.hawk.Hawk;
+
+import org.horaapps.leafpic.data.provider.CPHelper;
+import org.horaapps.leafpic.data.sort.SortingMode;
+import org.horaapps.leafpic.data.sort.SortingOrder;
 
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileNotFoundException;
-import java.io.FileOutputStream;
-import java.io.IOException;
-import java.io.ObjectInputStream;
-import java.io.ObjectOutputStream;
-import java.io.OptionalDataException;
-import java.io.StreamCorruptedException;
 import java.util.ArrayList;
-import java.util.Collections;
+import java.util.HashMap;
+import java.util.HashSet;
+
+import io.reactivex.Observable;
+import io.reactivex.android.schedulers.AndroidSchedulers;
+import io.reactivex.disposables.Disposable;
+import io.reactivex.schedulers.Schedulers;
 
 /**
  * Created by dnld on 27/04/16.
  */
 public class HandlingAlbums {
 
-  public final static String TAG = "HandlingAlbums";
-  private static String backupFile = "albums.dat";
+    public static final String TAG = "handling-albums";
 
-  public ArrayList<Album> dispAlbums;
-  private ArrayList<Album> selectedAlbums;
-
-  private PreferenceUtil SP;
-
-  private int current = 0;
-  private boolean hidden;
-
-  public HandlingAlbums(Context context) {
-    SP = PreferenceUtil.getInstance(context);
-    dispAlbums = new ArrayList<Album>();
-    selectedAlbums = new ArrayList<Album>();
-  }
+    public static final String KEY_EXCLUDED_FOLDERS = "excluded_folders";
+    public static final String KEY_INCLUDED_FOLDERS = "included_folders";
 
 
-  public void loadAlbums(Context context, boolean hidden) {
-    this.hidden = hidden;
+    private static final String CACHE_KEY_LOCAL_ALBUMS = "local";
+    private static final String CACHE_KEY_HIDDEN_ALBUMS = "hidden";
 
-    ArrayList<Album> list = new ArrayList<Album>();
-    if (SP.getBoolean(context.getString(org.horaapps.leafpic.R.string.preference_use_alternative_provider), false)) {
-      StorageProvider p = new StorageProvider(context);
-      list = p.getAlbums(context, hidden);
-    } else {
-      list.addAll(MediaStoreProvider.getAlbums(context, hidden));
+    private static HandlingAlbums mInstance = null;
+    private Context context;
+
+    private HashMap<String, ArrayList<Album>> cachedAlbums;
+    private Disposable cachedAlbumsSubscibe;
+
+
+    private HandlingAlbums(Context context) {
+        this.context = context;
+        cachedAlbums = new HashMap<>(2);
     }
-    dispAlbums = list;
-    sortAlbums(context);
-  }
 
-  public void addAlbum(int position, Album album) {
-    dispAlbums.add(position, album);
-    setCurrentAlbum(album);
-
-  }
-
-  public void setCurrentAlbum(Album album) {
-    current = dispAlbums.indexOf(album);
-  }
-
-
-  public Album getCurrentAlbum() {
-    return dispAlbums.get(current);
-  }
-
-  public void saveBackup(final Context context) {
-    if (!hidden) {
-      new Thread(new Runnable() {
-        public void run() {
-          FileOutputStream outStream;
-          try {
-            File f = new File(context.getCacheDir(), backupFile);
-            outStream = new FileOutputStream(f);
-            ObjectOutputStream objectOutStream = new ObjectOutputStream(outStream);
-            objectOutStream.writeObject(dispAlbums);
-            objectOutStream.close();
-          } catch (FileNotFoundException e1) {
-            e1.printStackTrace();
-          } catch (IOException e1) {
-            e1.printStackTrace();
-          }
+    public static HandlingAlbums getInstance(Context context) {
+        if (mInstance == null) {
+            mInstance = new HandlingAlbums(context.getApplicationContext());
         }
-      }).start();
+        return mInstance;
     }
-  }
 
-  public static void addAlbumToBackup(final Context context, final Album album) {
-    new Thread(new Runnable() {
-      public void run() {
-        try {
-          boolean success = false;
-          File f = new File(context.getCacheDir(), backupFile);
-          ObjectInputStream reader = new ObjectInputStream(new FileInputStream(f));
-          Object o = reader.readObject();
-          ArrayList<Album> list = null;
-          if (o != null) {
-            list = (ArrayList<Album>) o;
-            for(int i = 0; i < list.size(); i++) {
-              if (list.get(i).equals(album)) {
-                list.remove(i);
-                list.add(i, album);
-                success = true;
-              }
+    public Observable<Album> getAlbums(boolean hidden, SortingMode sortingMode, SortingOrder sortingOrder) {
+
+        String cacheKey = hidden ? CACHE_KEY_HIDDEN_ALBUMS : CACHE_KEY_LOCAL_ALBUMS;
+
+        if (cachedAlbums.containsKey(cacheKey)) {
+            Log.v(TAG, "using cached albums");
+            return getCachedAlums(cacheKey);
+        } else {
+            Log.v(TAG, "retrieving and caching albums");
+            return getAndCacheAlbums(hidden, sortingMode, sortingOrder);
+        }
+    }
+
+    private Observable<Album> getCachedAlums(String cacheKey) {
+        return Observable.create((pub) -> {
+            for (Album cachedAlbum : cachedAlbums.get(cacheKey)) {
+                pub.onNext(cachedAlbum);
             }
-          }
 
-          if (success) {
-            ObjectOutputStream objectOutStream = new ObjectOutputStream(new FileOutputStream(f));
-            objectOutStream.writeObject(list);
-            objectOutStream.close();
-          }
-
-        } catch (FileNotFoundException e1) {
-          e1.printStackTrace();
-        } catch (IOException e1) {
-          e1.printStackTrace();
-        } catch (ClassNotFoundException e) {
-          e.printStackTrace();
-        }
-      }
-    }).start();
-  }
-
-
-  public void restoreBackup(Context context) {
-    FileInputStream inStream;
-    try {
-      File f = new File(context.getCacheDir(), backupFile);
-      inStream = new FileInputStream(f);
-      ObjectInputStream objectInStream = new ObjectInputStream(inStream);
-
-      dispAlbums = (ArrayList<Album>) objectInStream.readObject();
-
-      objectInStream.close();
-    } catch (FileNotFoundException e1) {
-      e1.printStackTrace();
-    } catch (ClassNotFoundException e1) {
-      e1.printStackTrace();
-    } catch (OptionalDataException e1) {
-      e1.printStackTrace();
-    } catch (StreamCorruptedException e1) {
-      e1.printStackTrace();
-    } catch (IOException e1) {
-      e1.printStackTrace();
+            pub.onComplete();
+        });
     }
-  }
 
-  private int toggleSelectAlbum(int index) {
-    if (dispAlbums.get(index) != null) {
-      dispAlbums.get(index).setSelected(!dispAlbums.get(index).isSelected());
-      if (dispAlbums.get(index).isSelected()) selectedAlbums.add(dispAlbums.get(index));
-      else selectedAlbums.remove(dispAlbums.get(index));
+
+    private Observable<Album> getAndCacheAlbums(boolean hidden, SortingMode sortingMode, SortingOrder sortingOrder) {
+
+        if (cachedAlbumsSubscibe != null && !cachedAlbumsSubscibe.isDisposed())
+            cachedAlbumsSubscibe.dispose();
+
+        ArrayList<Album> albums = new ArrayList<>();
+        Observable<Album> observable = hidden ? CPHelper.getHiddenAlbums(context, getExcludedFolders()) : CPHelper.getAlbums(context, getExcludedFolders(), sortingMode, sortingOrder);
+
+        return Observable.create((pub) -> {
+
+            cachedAlbumsSubscibe = observable.subscribeOn(Schedulers.io())
+                    .map(album -> album.withSettings(getSettings(album.getPath())))
+                    .observeOn(AndroidSchedulers.mainThread())
+                    .doOnNext((album) -> {
+                        pub.onNext(album);
+                        albums.add(album);
+                    })
+                    .doOnError(pub::onError)
+                    .doOnComplete(() -> {
+                        cachedAlbums.put(hidden ? CACHE_KEY_HIDDEN_ALBUMS : CACHE_KEY_LOCAL_ALBUMS, albums);
+                        pub.onComplete();
+                    })
+                    .subscribe();
+
+        });
     }
-    return index;
-  }
 
-  public int toggleSelectAlbum(Album album) {
-    return toggleSelectAlbum(dispAlbums.indexOf(album));
-  }
-
-  public Album getAlbum(int index){ return dispAlbums.get(index); }
-
-  public void selectAllAlbums() {
-    for (Album dispAlbum : dispAlbums)
-      if (!dispAlbum.isSelected()) {
-        dispAlbum.setSelected(true);
-        selectedAlbums.add(dispAlbum);
-      }
-  }
-
-  public void removeCurrentAlbum(){ dispAlbums.remove(current); }
-
-  public int getSelectedCount() {
-    return selectedAlbums.size();
-  }
-
-  public void clearSelectedAlbums() {
-    for (Album dispAlbum : dispAlbums)
-      dispAlbum.setSelected(false);
-
-    selectedAlbums.clear();
-  }
-
-  public void installShortcutForSelectedAlbums(Context appCtx) {
-    for (Album selectedAlbum : selectedAlbums) {
-
-      Intent shortcutIntent;
-      shortcutIntent = new Intent(appCtx, SplashScreen.class);
-      shortcutIntent.setAction(SplashScreen.ACTION_OPEN_ALBUM);
-      shortcutIntent.putExtra("albumPath", selectedAlbum.getPath());
-      shortcutIntent.putExtra("albumId", selectedAlbum.getId());
-      shortcutIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-      shortcutIntent.addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP);
-
-      Intent addIntent = new Intent();
-      addIntent.putExtra(Intent.EXTRA_SHORTCUT_INTENT, shortcutIntent);
-      addIntent.putExtra(Intent.EXTRA_SHORTCUT_NAME, selectedAlbum.getName());
-
-      File image = new File(selectedAlbum.getCoverAlbum().getPath());
-      Bitmap bitmap;
-
-      String mime = StringUtils.getMimeType(image.getAbsolutePath());
-
-      if(mime.startsWith("image")) {
-        bitmap = BitmapFactory.decodeFile(image.getAbsolutePath(), new BitmapFactory.Options());
-      } else if(mime.startsWith("video")) {
-        bitmap = ThumbnailUtils.createVideoThumbnail(selectedAlbum.getCoverAlbum().getPath(),
-                MediaStore.Images.Thumbnails.MINI_KIND);
-      } else return;
-      bitmap = Bitmap.createScaledBitmap(getCroppedBitmap(bitmap), 128, 128, false);
-      addIntent.putExtra(Intent.EXTRA_SHORTCUT_ICON, addWhiteBorder(bitmap, 5));
-
-      addIntent.setAction("com.android.launcher.action.INSTALL_SHORTCUT");
-      appCtx.sendBroadcast(addIntent);
+    private void invalidateAlbumsCache() {
+        cachedAlbums = new HashMap<>(2);
     }
-  }
 
-  private Bitmap addWhiteBorder(Bitmap bmp, int borderSize) {
-    Bitmap bmpWithBorder = Bitmap.createBitmap(bmp.getWidth() + borderSize * 2, bmp.getHeight() + borderSize * 2, bmp.getConfig());
-    Canvas canvas = new Canvas(bmpWithBorder);
-    canvas.drawColor(Color.WHITE);
-    canvas.drawBitmap(bmp, borderSize, borderSize, null);
-    return bmpWithBorder;
-  }
-
-  private Bitmap getCroppedBitmap(Bitmap srcBmp){
-    Bitmap dstBmp;
-    if (srcBmp.getWidth() >= srcBmp.getHeight()){
-      dstBmp = Bitmap.createBitmap(srcBmp,
-              srcBmp.getWidth()/2 - srcBmp.getHeight()/2, 0,
-              srcBmp.getHeight(), srcBmp.getHeight()
-      );
-    } else {
-      dstBmp = Bitmap.createBitmap(srcBmp, 0,
-              srcBmp.getHeight()/2 - srcBmp.getWidth()/2,
-              srcBmp.getWidth(), srcBmp.getWidth()
-      );
+    private HashSet<String> getFolders(String key) {
+        return Hawk.get(key, new HashSet<String>());
     }
-    return dstBmp;
-  }
 
-  private void scanFile(Context context, String[] path) {   MediaScannerConnection.scanFile(context, path, null, null); }
-
-  public void hideAlbum(String path, Context context) {
-    File dirName = new File(path);
-    File file = new File(dirName, ".nomedia");
-    if (!file.exists()) {
-      try {
-        FileOutputStream out = new FileOutputStream(file);
-        out.flush();
-        out.close();
-        scanFile(context, new String[]{ file.getAbsolutePath() });
-      } catch (Exception e) {
-        e.printStackTrace();
-      }
+    public void removeFolderFormExcluded(String path) {
+        HashSet<String> folders = getFolders(KEY_EXCLUDED_FOLDERS);
+        folders.remove(path);
+        Hawk.put(KEY_EXCLUDED_FOLDERS, folders);
+        invalidateAlbumsCache();
     }
-  }
-  public void hideSelectedAlbums(Context context) {
-    for (Album selectedAlbum : selectedAlbums)
-      hideAlbum(selectedAlbum, context);
-    clearSelectedAlbums();
-  }
 
-  private void hideAlbum(final Album a, Context context) {
-    hideAlbum(a.getPath(), context);
-    dispAlbums.remove(a);
-  }
-
-  public void unHideAlbum(String path, Context context) {
-    File dirName = new File(path);
-    File file = new File(dirName, ".nomedia");
-    if (file.exists()) {
-      if (file.delete())
-        scanFile(context, new String[]{ file.getAbsolutePath() });
+    public void excludeFolder(String path) {
+        HashSet<String> folders = getFolders(KEY_EXCLUDED_FOLDERS);
+        folders.add(path);
+        Hawk.put(KEY_EXCLUDED_FOLDERS, folders);
+        invalidateAlbumsCache();
     }
-  }
-  public void unHideSelectedAlbums(Context context) {
-    for (Album selectedAlbum : selectedAlbums)
-      unHideAlbum(selectedAlbum, context);
-    clearSelectedAlbums();
-  }
 
-  private void unHideAlbum(final Album a, Context context) {
-    unHideAlbum(a.getPath(), context);
-    dispAlbums.remove(a);
-  }
-
-  public boolean deleteSelectedAlbums(Context context) {
-    boolean success = true;
-
-    for (Album selectedAlbum : selectedAlbums) {
-      int index = dispAlbums.indexOf(selectedAlbum);
-      if(deleteAlbum(selectedAlbum, context))
-        dispAlbums.remove(index);
-      else success = false;
+    public void removeFolderFromIncluded(String path) {
+        HashSet<String> folders = getFolders(KEY_INCLUDED_FOLDERS);
+        folders.remove(path);
+        Hawk.put(KEY_INCLUDED_FOLDERS, folders);
     }
-    return success;
-  }
 
-  public boolean deleteAlbum(Album album, Context context) {
-    return ContentHelper.deleteFilesInFolder(context, new File(album.getPath()));
-  }
-
-  public void excludeSelectedAlbums(Context context) {
-    for (Album selectedAlbum : selectedAlbums)
-      excludeAlbum(context, selectedAlbum);
-
-    clearSelectedAlbums();
-  }
-
-  private void excludeAlbum(Context context, Album a) {
-    CustomAlbumsHelper h = CustomAlbumsHelper.getInstance(context);
-    h.excludeAlbum(a.getPath());
-    dispAlbums.remove(a);
-  }
-
-  public SortingMode getSortingMode() {
-    return SortingMode.fromValue(SP.getInt("albums_sorting_mode", SortingMode.DATE.getValue()));
-  }
-
-  public SortingOrder getSortingOrder() {
-    return SortingOrder.fromValue(SP.getInt("albums_sorting_order", SortingOrder.DESCENDING.getValue()));
-  }
-
-  public void setDefaultSortingMode(SortingMode sortingMode) {
-    SP.putInt("albums_sorting_mode", sortingMode.getValue());
-  }
-
-  public void setDefaultSortingAscending(SortingOrder sortingOrder) {
-    SP.putInt("albums_sorting_order", sortingOrder.getValue());
-  }
-
-  public void sortAlbums(final Context context) {
-
-    Album camera = null;
-
-    for(Album album : dispAlbums)
-      if (album.getName().equals("Camera") && dispAlbums.remove(album)) {
-        camera = album;
-        break;
-      }
-
-    Collections.sort(dispAlbums, AlbumsComparators.getComparator(getSortingMode(), getSortingOrder()));
-
-    if (camera != null) {
-      camera.setName(context.getString(R.string.camera));
-      dispAlbums.add(0, camera);
+    public void includeFolder(String path) {
+        HashSet<String> folders = getFolders(KEY_INCLUDED_FOLDERS);
+        folders.add(path);
+        Hawk.put(KEY_INCLUDED_FOLDERS, folders);
     }
-  }
 
-  public Album getSelectedAlbum(int index) { return selectedAlbums.get(index); }
+    public ArrayList<String> getExcludedFolders(Context context) {
 
-  public void loadAlbums(Context applicationContext) {
-    loadAlbums(applicationContext, hidden);
-  }
+        ArrayList<String> list = new ArrayList<>(getFolders(KEY_EXCLUDED_FOLDERS));
+        HashSet<File> storageRoots = StorageHelper.getStorageRoots(context);
+        for(File file : storageRoots)
+            // it has a lot of garbage
+            list.add(new File(file.getPath(), "Android").getPath());
+
+        return list;
+    }
+
+    public ArrayList<String> getExcludedFolders() {
+        return getExcludedFolders(context);
+    }
+
+    public ArrayList<String> getIncludedFolders() {
+        return new ArrayList<>(getFolders(KEY_INCLUDED_FOLDERS));
+    }
+
+    public void setPined(String path, boolean pinned) {
+        AlbumSettings settings = getSettings(path);
+        settings.pinned = pinned;
+        saveSettings(path, settings);
+    }
+
+    public void setCover(String path, String mediaPath) {
+        AlbumSettings settings = getSettings(path);
+        settings.coverPath = mediaPath;
+        saveSettings(path, settings);
+    }
+
+    public void setSortingMode(String path, int column) {
+        AlbumSettings settings = getSettings(path);
+        settings.sortingMode = column;
+        saveSettings(path, settings);
+    }
+
+    public void setSortingOrder(String path, int sortingOrder) {
+        AlbumSettings settings = getSettings(path);
+        settings.sortingOrder = sortingOrder;
+        saveSettings(path, settings);
+    }
+
+    private static AlbumSettings getSettings(String path) {
+//        Timer timer = new Timer("new-settings");
+//        timer.start();
+        return Hawk.get(getSettingsKey(path), AlbumSettings.getDefaults());
+//        timer.stop();
+        //albumSettings;
+    }
+
+    private static void saveSettings(String path, AlbumSettings settings) {
+        Hawk.put(getSettingsKey(path), settings);
+    }
+
+    private static String getSettingsKey(String path) {
+        return String.format("%s_%s", "albums_settings", path);
+    }
+
 }
